@@ -1,0 +1,16 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "codecheck"
+version = "0.1.0"
+description = "Static security analyzer for Python with taint tracking and SARIF output"
+requires-python = ">=3.9"
+readme = "README.md"
+
+[project.scripts]
+codecheck = "codecheck.cli:main"
+
+[tool.setuptools]
+packages = ["codecheck"]
