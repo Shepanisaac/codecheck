@@ -9,15 +9,16 @@ import os
 import sys
 
 from . import __version__
-from .analyzer import Finding, analyze_source
+from .core import Finding, MissingDependency
+from .languages import analyze_source, is_generated, language_for
 from .report import to_json, to_sarif, to_text
 from .rules import SEVERITY_ORDER
 
 SKIP_DIRS = {".git", ".hg", ".venv", "venv", "env", "node_modules", "__pycache__",
-             "site-packages", "build", "dist", ".tox", ".mypy_cache"}
+             "site-packages", "build", "dist", ".tox", ".mypy_cache", "coverage", ".next"}
 
 
-def iter_python_files(paths):
+def iter_source_files(paths):
     for p in paths:
         if os.path.isfile(p):
             yield p
@@ -25,29 +26,42 @@ def iter_python_files(paths):
             for root, dirs, files in os.walk(p):
                 dirs[:] = sorted(d for d in dirs if d not in SKIP_DIRS and not d.startswith("."))
                 for f in sorted(files):
-                    if f.endswith(".py"):
-                        yield os.path.join(root, f)
+                    path = os.path.join(root, f)
+                    if language_for(path) and not is_generated(path):
+                        yield path
         else:
             print(f"codecheck: no such file or directory: {p}", file=sys.stderr)
 
 
 def scan_paths(paths) -> tuple[list[Finding], list[str]]:
-    findings, errors = [], []
-    for path in iter_python_files(paths):
+    findings, errors, missing = [], [], {}
+    for path in iter_source_files(paths):
+        lang = language_for(path)
+        if lang is None:
+            errors.append(f"{path}: unsupported file type (supported: .py, .js, .jsx, .mjs, .cjs)")
+            continue
         try:
             with open(path, encoding="utf-8", errors="replace") as fh:
                 src = fh.read()
-            findings.extend(analyze_source(src, path))
+            findings.extend(analyze_source(src, path, lang))
+        except MissingDependency as e:
+            missing.setdefault(str(e), []).append(path)
         except SyntaxError as e:
             errors.append(f"{path}:{e.lineno}: could not parse ({e.msg})")
         except OSError as e:
             errors.append(f"{path}: {e}")
+        except RecursionError:
+            errors.append(f"{path}: skipped (code nested too deeply to analyze)")
+        except Exception as e:  # noqa: BLE001 - keep scanning the other files
+            errors.append(f"{path}: internal error {type(e).__name__}: {e}")
+    for msg, files in missing.items():
+        errors.append(f"skipped {len(files)} file(s), e.g. {files[0]}. {msg}")
     return findings, errors
 
 
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser(prog="codecheck",
-                                 description="Static security analyzer for Python code.")
+                                 description="Static security analyzer for Python and JavaScript code.")
     ap.add_argument("paths", nargs="+", help="files or directories to scan")
     ap.add_argument("-f", "--format", choices=["text", "json", "sarif"], default="text")
     ap.add_argument("-o", "--output", help="write report to this file instead of stdout")

@@ -86,11 +86,16 @@ class Negatives(unittest.TestCase):
         self.assertEqual(ids("cur.execute('SELECT * FROM t WHERE a=?', (input(),))"), [])
 
     def test_sanitizers_clear_taint(self):
-        # sanitized input is never "high" (proven taint); a dynamic command stays a medium smell
-        for src in ("import os\nos.system('kill ' + str(int(input())))",
-                    "import os, shlex\nos.system('ls ' + shlex.quote(input()))"):
-            self.assertEqual(sev(src, "CS003"), ["medium"])
-        self.assertEqual(ids("import os\nos.system(str(int(input())))"), [])
+        self.assertEqual(ids("import os\nos.system('kill ' + str(int(input())))"), [])
+        self.assertEqual(ids("import os, shlex\nos.system('ls ' + shlex.quote(input()))"), [])
+        self.assertEqual(ids("n = int(input())\ncur.execute(f'SELECT * FROM t WHERE id = {n}')"), [])
+
+    def test_sanitized_in_one_branch_only_is_still_dangerous(self):
+        src = ("import os\nx = int(input())\nif cond:\n    x = input()\n"
+               "os.system('kill ' + x)\n")
+        self.assertEqual(sev(src, "CS003"), ["high"])
+        src = "import os\nx = int(input()) if c else 'a'\nx2 = x or input()\nos.system('k ' + x2)\n"
+        self.assertEqual(sev(src, "CS003"), ["high"])
 
     def test_safe_apis(self):
         self.assertEqual(ids("import yaml\nyaml.safe_load(input())"), [])

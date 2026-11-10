@@ -11,14 +11,10 @@ from __future__ import annotations
 
 import ast
 import re
-from dataclasses import dataclass, asdict
 
-from .rules import RULES, SEVERITY_ORDER
-
-TAINT = 1
-DYN = 2
-RAW = 4    # attacker text that has not passed through a transforming function (XSS-relevant)
-PROP = TAINT | RAW
+from .core import (DYN, PROP, RAW, SAFE, TAINT, BaseAnalyzer, Finding, is_placeholder,
+                   join, looks_like_secret_name, merge_env)
+from .rules import RULES
 
 SOURCE_CALLS = {"input", "raw_input", "sys.stdin.read", "sys.stdin.readline"}
 
@@ -49,52 +45,6 @@ HTTP_FUNCS |= {"urllib.request.urlopen", "urllib.urlopen", "urllib2.urlopen"}
 HTTP_REQUEST_FUNCS = {"requests.request", "httpx.request"}  # url is 2nd arg
 ROUTE_DECORATORS = {"route", "get", "post", "put", "patch", "delete"}
 
-SECRET_RE = re.compile(
-    r"(^|_)(pass|password|passwd|pwd|secret|api_?key|apikey|access_?key|"
-    r"auth_?token|token|private_?key|client_secret|credentials?)($|_)")
-NOT_A_SECRET_SUFFIX = {
-    "type", "field", "name", "url", "path", "header", "label", "file", "len",
-    "length", "expiry", "ttl", "endpoint", "env", "var", "prompt", "message",
-    "msg", "help", "hint", "text", "placeholder", "format", "param", "key_name",
-}
-SUPPRESS_RE = re.compile(
-    r"#\s*(?:nosec|codecheck:\s*ignore)(?:\[([A-Za-z0-9_,\s]+)\])?")
-
-
-@dataclass
-class Finding:
-    rule_id: str
-    severity: str
-    message: str
-    file: str
-    line: int
-    col: int
-    snippet: str = ""
-    tainted: bool = False
-
-    @property
-    def cwe(self) -> str:
-        return RULES[self.rule_id].cwe
-
-    @property
-    def owasp(self) -> str:
-        return RULES[self.rule_id].owasp
-
-    def to_dict(self) -> dict:
-        d = asdict(self)
-        d["cwe"], d["owasp"] = self.cwe, self.owasp
-        return d
-
-
-def _snake(name: str) -> str:
-    return re.sub(r"(?<=[a-z0-9])(?=[A-Z])", "_", name).lower()
-
-
-def looks_like_secret_name(name: str) -> bool:
-    s = _snake(name)
-    return bool(SECRET_RE.search(s)) and s.split("_")[-1] not in NOT_A_SECRET_SUFFIX
-
-
 def _is_str(n: ast.AST) -> bool:
     return isinstance(n, ast.Constant) and isinstance(n.value, str)
 
@@ -105,29 +55,22 @@ def _is_const(n: ast.AST) -> bool:
     return isinstance(n, (ast.Tuple, ast.List)) and all(_is_const(e) for e in n.elts)
 
 
-def _merge(a: dict, b: dict) -> dict:
-    out = dict(a)
-    for k, v in b.items():
-        out[k] = out.get(k, 0) | v
-    return out
+_merge = merge_env
 
 
-class Analyzer:
+class Analyzer(BaseAnalyzer):
     def __init__(self, source: str, filename: str = "<string>"):
-        self.source = source
-        self.filename = filename
-        self.lines = source.splitlines()
+        super().__init__(source, filename)
         self.aliases: dict[str, str] = {}
         self.env: dict[str, int] = {}
         self.in_route = False
-        self.found: dict[tuple, Finding] = {}
 
     # ------------------------------------------------------------------ public
     def run(self) -> list[Finding]:
         tree = ast.parse(self.source, filename=self.filename)
         self._collect_imports(tree)
         self.block(tree.body)
-        return sorted(self.found.values(), key=lambda f: (f.line, f.col, f.rule_id))
+        return self.results()
 
     # ----------------------------------------------------------------- helpers
     def _collect_imports(self, tree: ast.AST) -> None:
@@ -157,28 +100,7 @@ class Analyzer:
 
     def report(self, rule_id: str, node: ast.AST, message: str,
                severity: str | None = None, tainted: bool = False) -> None:
-        line, col = node.lineno, node.col_offset + 1
-        text = self.lines[line - 1] if 0 < line <= len(self.lines) else ""
-        m = SUPPRESS_RE.search(text)
-        if m:
-            ids = m.group(1)
-            if not ids or rule_id in {i.strip() for i in ids.split(",")}:
-                return
-        severity = severity or RULES[rule_id].severity
-        key = (rule_id, line, col)
-        old = self.found.get(key)
-        if old and SEVERITY_ORDER[old.severity] >= SEVERITY_ORDER[severity]:
-            return
-        self.found[key] = Finding(rule_id, severity, message, self.filename,
-                                  line, col, text.strip(), tainted)
-
-    def sev(self, flags: int, taint_msg: str, dyn_msg: str | None = None):
-        """Pick (severity, message, tainted) from flags, or None if clean."""
-        if flags & PROP:
-            return "high", taint_msg, True
-        if dyn_msg and flags & DYN:
-            return "medium", dyn_msg, False
-        return None
+        self.add(rule_id, node.lineno, node.col_offset + 1, message, severity, tainted)
 
     # -------------------------------------------------------------- statements
     def block(self, stmts) -> None:
@@ -222,8 +144,9 @@ class Analyzer:
         if isinstance(n, ast.AugAssign):
             f = self.expr(n.value)
             if isinstance(n.target, ast.Name):
-                new = self.env.get(n.target.id, 0) | f
-                if isinstance(n.op, (ast.Add, ast.Mod)) and not isinstance(n.value, ast.Constant):
+                new = join(self.env.get(n.target.id, 0), f)
+                if isinstance(n.op, (ast.Add, ast.Mod)) and not (
+                        isinstance(n.value, ast.Constant) or f & SAFE):
                     new |= DYN
                 self.env[n.target.id] = new
             else:
@@ -349,7 +272,7 @@ class Analyzer:
         if not name:
             return
         if looks_like_secret_name(name):
-            if _is_str(value) and value.value and not value.value.startswith(("<", "${", "{{")):
+            if _is_str(value) and value.value and not is_placeholder(value.value):
                 self.report("CS004", value, f"Hardcoded credential assigned to '{name}'")
             for c in ast.walk(value):
                 if isinstance(c, ast.Call) and (self.dotted(c.func) or "").startswith("random."):
@@ -400,9 +323,10 @@ class Analyzer:
         f, dyn = 0, False
         for v in n.values:
             if isinstance(v, ast.FormattedValue):
-                f |= self.expr(v.value) & PROP
+                fv = self.expr(v.value)
+                f |= fv & PROP
                 self.expr(v.format_spec)
-                if not isinstance(v.value, ast.Constant):
+                if not (isinstance(v.value, ast.Constant) or fv & SAFE):
                     dyn = True
         return f | (DYN if dyn else 0)
 
@@ -413,19 +337,21 @@ class Analyzer:
             stringy = (_is_str(n.left) or _is_str(n.right)
                        or isinstance(n.left, ast.JoinedStr) or isinstance(n.right, ast.JoinedStr)
                        or (l | r) & DYN)
-            if stringy and not (_is_const(n.left) and _is_const(n.right)):
+            inert = (_is_const(n.left) or l & SAFE) and (_is_const(n.right) or r & SAFE)
+            if stringy and not inert:
                 f |= DYN
         return f
 
     def e_BoolOp(self, n):
-        f = 0
-        for v in n.values:
-            f |= self.expr(v)
+        fs = [self.expr(v) for v in n.values]
+        f = fs[0]
+        for x in fs[1:]:
+            f = join(f, x)
         return f
 
     def e_IfExp(self, n):
         self.expr(n.test)
-        return self.expr(n.body) | self.expr(n.orelse)
+        return join(self.expr(n.body), self.expr(n.orelse))
 
     def e_Compare(self, n):
         self.expr(n.left)
@@ -476,19 +402,23 @@ class Analyzer:
         elif not isinstance(func, ast.Name):
             recv = self.expr(func)
         af = [self.expr(a) for a in n.args]
-        kf = {k.arg: self.expr(k.value) for k in n.keywords}
+        kfl = [self.expr(k.value) for k in n.keywords]
+        kf = {k.arg: f for k, f in zip(n.keywords, kfl)}
         name = self.dotted(func)
         self.check_call(n, name, af, kf)
 
         if name in SANITIZERS:
-            return 0
+            return SAFE
+        if name in ("str", "repr") and af and all(x & SAFE for x in af):
+            return SAFE
         if name in SOURCE_CALLS:
             return TAINT | RAW
         out = (recv | _or(af) | _or(kf.values())) & TAINT
         if (isinstance(func, ast.Attribute) and recv & RAW) or name == "str":
             out |= (recv | _or(af)) & RAW  # .strip()/.lower()/str() keep it reflected-text
         if isinstance(func, ast.Attribute) and func.attr == "format":
-            if any(not _is_const(a) for a in n.args + [k.value for k in n.keywords]):
+            parts = list(zip(n.args, af)) + list(zip([k.value for k in n.keywords], kfl))
+            if any(not (_is_const(a) or fl & SAFE) for a, fl in parts):
                 out |= DYN
         return out
 

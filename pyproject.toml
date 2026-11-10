@@ -4,10 +4,13 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "codecheck"
-version = "0.1.0"
-description = "Static security analyzer for Python with taint tracking and SARIF output"
+version = "0.2.0"
+description = "Static security analyzer for Python and JavaScript with taint tracking and SARIF output"
 requires-python = ">=3.9"
 readme = "README.md"
+
+[project.optional-dependencies]
+js = ["tree-sitter>=0.23", "tree-sitter-javascript>=0.23"]
 
 [project.scripts]
 codecheck = "codecheck.cli:main"
